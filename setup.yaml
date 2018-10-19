@@ -1,0 +1,181 @@
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: [""]
+  resources:
+  - nodes
+  - nodes/proxy
+  - services
+  - endpoints
+  - pods
+  verbs: ["get", "list", "watch"]
+- apiGroups:
+  - extensions
+  resources:
+  - ingresses
+  verbs: ["get", "list", "watch"]
+- nonResourceURLs: ["/metrics", "/stats/prometheus"]
+  verbs: ["get"]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: istio-system
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-stackdriver
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: istio-system
+---
+apiVersion: v1
+kind: List
+items:
+- kind: Service
+  apiVersion: v1
+  metadata:
+    labels:
+      name: prometheus
+    name: prometheus
+    namespace: istio-system
+  spec:
+    selector:
+      app: prometheus
+    type: ClusterIP
+    ports:
+    - name: prometheus
+      protocol: TCP
+      port: 9090
+- kind: Deployment
+  apiVersion: extensions/v1beta1
+  metadata:
+    name: prometheus
+    namespace: istio-system
+  spec:
+    replicas: 1
+    selector:
+      matchLabels:
+        app: prometheus
+    template:
+      metadata:
+        name: prometheus
+        namespace: istio-system
+        labels:
+          app: prometheus
+        annotations:
+          prometheus.io/scrape: 'true'
+      spec:
+        # Needed when using unmodified rbac-setup.yml
+        serviceAccountName: prometheus
+        containers:
+        - name: prometheus
+          image: gcr.io/stackdriver-prometheus/stackdriver-prometheus:release-0.4.4
+          # Uncomment this to enable debug logs. Can be very verbose.
+          args: ["--config.file=/etc/prometheus/prometheus.yml", "--stackdriver.metric-prefix=custom.googleapis.com"]
+          # Helps during development, when reusing the tag.
+          imagePullPolicy: Always
+          ports:
+          - name: web
+            containerPort: 9090
+          volumeMounts:
+          - name: config-volume
+            mountPath: /etc/prometheus
+        volumes:
+        - name: config-volume
+          configMap:
+            name: prometheus
+- kind: ConfigMap
+  apiVersion: v1
+  data:
+    prometheus.yml: |
+      global:
+        external_labels:
+          _stackdriver_project_id: ''
+          _kubernetes_cluster_name: ''
+          _kubernetes_location: ''
+
+      # Scrape config for envoy stats
+      scrape_configs:
+      - job_name: 'envoy-stats'
+        metrics_path: /stats/prometheus
+        kubernetes_sd_configs:
+        - role: pod
+
+        relabel_configs:
+        - source_labels: [__meta_kubernetes_pod_container_port_name]
+          action: keep
+          regex: '.*-envoy-prom'
+        - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+          action: replace
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:15090
+          target_label: __address__
+        - action: labelmap
+          regex: __meta_kubernetes_pod_label_(.+)
+        - source_labels: [__meta_kubernetes_namespace]
+          action: replace
+          target_label: namespace
+        - source_labels: [__meta_kubernetes_pod_name]
+          action: replace
+          target_label: pod_name
+
+        metric_relabel_configs:
+        # Exclude some of the envoy metrics that have massive cardinality
+        # This list may need to be pruned further moving forward, as informed
+        # by performance and scalability testing.
+        - source_labels: [ cluster_name ]
+          regex: '(outbound|inbound|prometheus_stats).*'
+          action: drop
+        - source_labels: [ tcp_prefix ]
+          regex: '(outbound|inbound|prometheus_stats).*'
+          action: drop
+        - source_labels: [ listener_address ]
+          regex: '(.+)'
+          action: drop
+        - source_labels: [ http_conn_manager_listener_prefix ]
+          regex: '(.+)'
+          action: drop
+        - source_labels: [ http_conn_manager_prefix ]
+          regex: '(.+)'
+          action: drop
+        - source_labels: [ __name__ ]
+          regex: 'envoy_tls.*'
+          action: drop
+        - source_labels: [ __name__ ]
+          regex: 'envoy_tcp_downstream.*'
+          action: drop
+        - source_labels: [ __name__ ]
+          regex: 'envoy_http_(stats|admin).*'
+          action: drop
+        - source_labels: [ __name__ ]
+          regex: 'envoy_cluster_(lb|retry|bind|internal|max|original).*'
+          action: drop
+
+      remote_write:
+      - url: "https://monitoring.googleapis.com:443/"
+        queue_config:
+          # Capacity should be 2*max_samples_per_send.
+          capacity: 400
+          max_samples_per_send: 200
+          max_shards: 10000
+        write_relabel_configs:
+        # These labels are generally redundant with the Stackdriver monitored resource labels.
+        - source_labels: [job]
+          target_label: job
+          replacement: ""
+        - source_labels: [instance]
+          target_label: instance
+          replacement: ""
+  metadata:
+    name: prometheus
+    namespace: istio-system
